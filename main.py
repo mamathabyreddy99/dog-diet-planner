@@ -27,8 +27,8 @@ MEAT_MIN = 200
 MEAT_MAX = 250
 PROTEIN_MIN_PERCENT = 32
 PROTEIN_MAX_PERCENT = 42
-FAT_MIN_PERCENT = 3
-FAT_MAX_PERCENT = 6
+FIBER_MIN_PERCENT = 3
+FIBER_MAX_PERCENT = 6
 
 
 class IngredientRequest(BaseModel):
@@ -283,40 +283,59 @@ def calculate_diet(request: IngredientRequest):
                 if total["Protein"] * 100 / FIXED_TOTAL_DM >= PROTEIN_MIN_PERCENT:
                     break
 
-    # Insert this block at the end of your calculate_diet function, just before the final return statement
 
-# ---- FIBER ADJUSTMENT LOGIC ----
-    fiber_percent = total["Fiber"] * 100 / FIXED_TOTAL_DM
 
-# Helper to find and scale vegetable ingredients
-    def adjust_vegetables(percent_change):
+    def recalculate_totals():
+        totals = {
+            "Protein": 0,
+            "Fat": 0,
+            "CHO": 0,
+            "Fiber": 0,
+            "Ash": 0,
+            "Ca": 0,
+            "P": 0,
+            "Iron": 0,
+            "Energy": 0
+        }
         for item in ingredient_totals:
-            if item["ingredient"] in used_ingredient_names and any(group in item["ingredient"].lower() for group in ["carrot", "broccoli", "spinach", "zucchini", "pumpkin"]):
+            totals["Protein"] += item["protein_g"]
+            totals["Fat"] += item["fat_g"]
+            totals["CHO"] += item["cho_g"]
+            totals["Fiber"] += item["fiber_g"]
+            totals["Ash"] += item["ash_g"]
+            totals["Ca"] += item["ca_mg"] / 1000
+            totals["P"] += item["p_mg"] / 1000
+            totals["Iron"] += item["iron_mg"] / 100
+            totals["Energy"] += item["energy_kcal"]
+        return totals
+
+    # ---- HELPER: Adjust vegetables up/down by percent ----
+    def adjust_vegetables_by_percent(percent_change):
+        for item in ingredient_totals:
+            name = item["ingredient"].lower()
+            if name in used_ingredient_names and any(veg in name for veg in ["carrot", "spinach", "broccoli", "pumpkin", "zucchini"]):
                 old_dm = item["dm_g"]
                 new_dm = round(old_dm * (1 + percent_change / 100), 2)
-                delta_dm = new_dm - old_dm
-                if abs(delta_dm) < 0.1:
-                    continue
+                scale = new_dm / old_dm if old_dm else 1
 
-                scale = new_dm / old_dm
+                item["dm_g"] = new_dm
                 for nutrient in ["protein_g", "fat_g", "cho_g", "fiber_g", "ash_g", "ca_mg", "p_mg", "iron_mg", "energy_kcal"]:
                     item[nutrient] = round(item[nutrient] * scale, 2)
-                item["dm_g"] = new_dm
+
                 for db in dm_breakdown:
-                    if db["ingredient"] == item["ingredient"] and not db["fixed"]:
+                    if db["ingredient"] == item["ingredient"] and not db.get("fixed", False):
                         db["dm_g"] = new_dm
                         break
-                for k in total:
-                    total[k] += (item[k.lower() + "_g"] if k in ["Protein", "Fat", "CHO", "Fiber", "Ash"] else 0)
 
-# Adjust if fiber < 3%
+    total = recalculate_totals()
+    fiber_percent = total["Fiber"] * 100 / FIXED_TOTAL_DM
+
+    # If fiber is too low, first try increasing veggies
     if fiber_percent < 3:
-        adjust_vegetables(10)
-    # Recalculate fiber after vegetable increase
-        total_fiber = sum(i["fiber_g"] for i in ingredient_totals)
-        fiber_percent = total_fiber * 100 / FIXED_TOTAL_DM
+        adjust_vegetables_by_percent(10)
+        total = recalculate_totals()
+        fiber_percent = total["Fiber"] * 100 / FIXED_TOTAL_DM
 
-    # If still < 3%, add psyllium husk or rice bran (up to 4.5% fiber total)
         if fiber_percent < 3:
             conn = get_connection()
             cursor = conn.cursor()
@@ -338,21 +357,33 @@ def calculate_diet(request: IngredientRequest):
                     dm_to_add = min(remaining_dm, max_allowed_dm)
                     added_dm = distribute_exact([{"ingredient": name, "group": group, "data": data}], dm_to_add)
                     remaining_dm -= added_dm
-                    fiber_percent += added_dm * fiber_per_dm * 100 / FIXED_TOTAL_DM
                     used_ingredient_names.add(name)
-
-# Adjust if fiber > 7%
+                    total = recalculate_totals()
+                    fiber_percent = total["Fiber"] * 100 / FIXED_TOTAL_DM
+    # If fiber is too high, reduce veggies gradually (with max 5 attempts)
     elif fiber_percent > 7:
-        while fiber_percent > 6:
-            adjust_vegetables(-10)
-            total_fiber = sum(i["fiber_g"] for i in ingredient_totals)
-            fiber_percent = total_fiber * 100 / FIXED_TOTAL_DM
-            if fiber_percent <= 6:
+        attempts = 0
+        previous_percent = fiber_percent
+
+        while fiber_percent > 6 and attempts < 5:
+            adjust_vegetables_by_percent(-10)
+            total = recalculate_totals()
+            fiber_percent = total["Fiber"] * 100 / FIXED_TOTAL_DM
+
+        # If percent doesn't change, break to avoid infinite loop
+            if abs(fiber_percent - previous_percent) < 0.01:
+                issues.append(f"Fiber reduction not effective after attempt {attempts+1}. Current: {fiber_percent:.2f}%")
                 break
 
-# Update final fiber percentage
-    #result["Fiber_percent"] = round(fiber_percent, 2)
+            previous_percent = fiber_percent
+            attempts += 1
 
+        if fiber_percent > 6:
+            issues.append(f"Fiber remains high ({fiber_percent:.2f}%) after {attempts} attempts to reduce it.")
+
+
+    
+    
 
     result = {
         "Protein_percent": round(total["Protein"] * 100 / FIXED_TOTAL_DM, 2),
