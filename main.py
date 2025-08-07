@@ -26,6 +26,9 @@ VEG_B_MIN = 50
 MEAT_MIN = 200
 MEAT_MAX = 250
 PROTEIN_MIN_PERCENT = 32
+PROTEIN_MAX_PERCENT = 42
+FAT_MIN_PERCENT = 3
+FAT_MAX_PERCENT = 6
 
 
 class IngredientRequest(BaseModel):
@@ -279,6 +282,77 @@ def calculate_diet(request: IngredientRequest):
                 total["Protein"] += added_dm * protein_per_g
                 if total["Protein"] * 100 / FIXED_TOTAL_DM >= PROTEIN_MIN_PERCENT:
                     break
+
+    # Insert this block at the end of your calculate_diet function, just before the final return statement
+
+# ---- FIBER ADJUSTMENT LOGIC ----
+    fiber_percent = total["Fiber"] * 100 / FIXED_TOTAL_DM
+
+# Helper to find and scale vegetable ingredients
+    def adjust_vegetables(percent_change):
+        for item in ingredient_totals:
+            if item["ingredient"] in used_ingredient_names and any(group in item["ingredient"].lower() for group in ["carrot", "broccoli", "spinach", "zucchini", "pumpkin"]):
+                old_dm = item["dm_g"]
+                new_dm = round(old_dm * (1 + percent_change / 100), 2)
+                delta_dm = new_dm - old_dm
+                if abs(delta_dm) < 0.1:
+                    continue
+
+                scale = new_dm / old_dm
+                for nutrient in ["protein_g", "fat_g", "cho_g", "fiber_g", "ash_g", "ca_mg", "p_mg", "iron_mg", "energy_kcal"]:
+                    item[nutrient] = round(item[nutrient] * scale, 2)
+                item["dm_g"] = new_dm
+                for db in dm_breakdown:
+                    if db["ingredient"] == item["ingredient"] and not db["fixed"]:
+                        db["dm_g"] = new_dm
+                        break
+                for k in total:
+                    total[k] += (item[k.lower() + "_g"] if k in ["Protein", "Fat", "CHO", "Fiber", "Ash"] else 0)
+
+# Adjust if fiber < 3%
+    if fiber_percent < 3:
+        adjust_vegetables(10)
+    # Recalculate fiber after vegetable increase
+        total_fiber = sum(i["fiber_g"] for i in ingredient_totals)
+        fiber_percent = total_fiber * 100 / FIXED_TOTAL_DM
+
+    # If still < 3%, add psyllium husk or rice bran (up to 4.5% fiber total)
+        if fiber_percent < 3:
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT ingredient_name, group_name, protein_g, fat_g, cho_g, fiber_g, ash_g, calcium_mg, phosphorus_mg, iron_mg, energy_kcal
+                FROM user_ingredients
+                WHERE LOWER(ingredient_name) IN ('psyllium husk', 'rice bran')
+            """)
+            fiber_boosters = cursor.fetchall()
+            conn.close()
+
+            for row in fiber_boosters:
+                if fiber_percent >= 4.5:
+                    break
+                name, group, *data = row
+                fiber_per_dm = data[3] / 100
+                if fiber_per_dm > 0:
+                    max_allowed_dm = min((4.5 - fiber_percent) * FIXED_TOTAL_DM / 100, 30)
+                    dm_to_add = min(remaining_dm, max_allowed_dm)
+                    added_dm = distribute_exact([{"ingredient": name, "group": group, "data": data}], dm_to_add)
+                    remaining_dm -= added_dm
+                    fiber_percent += added_dm * fiber_per_dm * 100 / FIXED_TOTAL_DM
+                    used_ingredient_names.add(name)
+
+# Adjust if fiber > 7%
+    elif fiber_percent > 7:
+        while fiber_percent > 6:
+            adjust_vegetables(-10)
+            total_fiber = sum(i["fiber_g"] for i in ingredient_totals)
+            fiber_percent = total_fiber * 100 / FIXED_TOTAL_DM
+            if fiber_percent <= 6:
+                break
+
+# Update final fiber percentage
+    #result["Fiber_percent"] = round(fiber_percent, 2)
+
 
     result = {
         "Protein_percent": round(total["Protein"] * 100 / FIXED_TOTAL_DM, 2),
